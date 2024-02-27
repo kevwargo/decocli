@@ -1,29 +1,26 @@
+import typing
 from argparse import ArgumentParser, Namespace
 from functools import wraps
 from inspect import FullArgSpec, getfullargspec
-from typing import Any, Callable, Type
+from types import NoneType, UnionType
 
 
-def cli(fn: Callable) -> Callable:
+def cli(fn: typing.Callable) -> typing.Callable:
     spec = getfullargspec(fn)
 
     if ns_class := _single_ns_arg_annotation(spec):
-
-        @wraps(fn)
-        def wrapped():
-            return fn(_parse_ns_args(ns_class))
-
+        args, kwargs = [_parse_ns_args(ns_class)], {}
     else:
+        args, kwargs = _parse_func_args(spec)
 
-        @wraps(fn)
-        def wrapped():
-            args, kwargs = _parse_func_args(spec)
-            return fn(*args, **kwargs)
+    @wraps(fn)
+    def wrapped():
+        fn(*args, **kwargs)
 
     return wrapped
 
 
-def _single_ns_arg_annotation(spec: FullArgSpec) -> Type[Namespace] | None:
+def _single_ns_arg_annotation(spec: FullArgSpec) -> typing.Type[Namespace] | None:
     if len(spec.args) != 1:
         return None
 
@@ -34,16 +31,8 @@ def _single_ns_arg_annotation(spec: FullArgSpec) -> Type[Namespace] | None:
     return None
 
 
-def _arg_name(name: str) -> str:
-    return "--" + name.replace("_", "-")
-
-
-def _parse_ns_args(ns_class: Type[Namespace]) -> Namespace:
-    parser = ArgumentParser()
-    for name in set(ns_class.__annotations__) | set(ns_class.__dict__):
-        if name.startswith("_"):
-            continue
-        parser.add_argument(_arg_name(name), **_build_kwargs(name, ns_class.__dict__, ns_class.__annotations__))
+def _parse_ns_args(ns_class: typing.Type[Namespace]) -> Namespace:
+    parser = _build_parser(ns_class.__dict__, ns_class.__annotations__)
 
     return parser.parse_args(namespace=ns_class())
 
@@ -51,9 +40,7 @@ def _parse_ns_args(ns_class: Type[Namespace]) -> Namespace:
 def _parse_func_args(spec: FullArgSpec) -> tuple[list, dict]:
     defaults = dict(spec.kwonlydefaults or {}) | dict(zip(reversed(spec.args), reversed(spec.defaults)))
 
-    parser = ArgumentParser()
-    for name in spec.args + spec.kwonlyargs:
-        parser.add_argument(_arg_name(name), **_build_kwargs(name, defaults, spec.annotations))
+    parser = _build_parser(defaults, spec.annotations, spec.args + spec.kwonlyargs)
 
     ns = parser.parse_args()
     args = [getattr(ns, a) for a in spec.args]
@@ -62,17 +49,48 @@ def _parse_func_args(spec: FullArgSpec) -> tuple[list, dict]:
     return args, kwargs
 
 
-def _build_kwargs(name: str, defaults: dict[str, Any], annotations: dict[str, type]) -> dict[str, Any]:
-    kwargs = {}
+def _build_parser(defaults, annotations, all_names=None) -> ArgumentParser:
+    parser = ArgumentParser()
 
-    if annotation := annotations.get(name):
-        if annotation == bool:
-            return {"action": "store_true"}
-        kwargs["type"] = annotation
+    for name in all_names or (set(defaults) | set(annotations)):
+        if name.startswith("_"):
+            continue
 
-    if name in defaults:
-        kwargs["default"] = defaults[name]
-    else:
-        kwargs["required"] = True
+        kwargs = {}
 
-    return kwargs
+        if arg_type := annotations.get(name):
+            if typing.get_origin(arg_type) is typing.Annotated:
+                type_args = typing.get_args(arg_type)
+                arg_type, annotated_metadata = type_args[0], type_args[1:]
+            else:
+                annotated_metadata = ()
+
+            if arg_type == bool:
+                kwargs["action"] = "store_true"
+                kwargs["required"] = False
+            elif opt := _extract_opt_from_union(arg_type):
+                kwargs["type"] = opt
+                kwargs["required"] = False
+            else:
+                kwargs["type"] = arg_type
+
+        if name in defaults:
+            kwargs["default"] = defaults[name]
+        elif "required" not in kwargs:
+            kwargs["required"] = True
+
+        args = annotated_metadata + ("--" + name.replace("_", "-"),)
+
+        parser.add_argument(*args, **kwargs)
+
+    return parser
+
+
+def _extract_opt_from_union(annotation: type | UnionType) -> type | None:
+    if not isinstance(annotation, UnionType):
+        return None
+
+    if len(annotation.__args__) == 2 and annotation.__args__[1] == NoneType:
+        return annotation.__args__[0]
+
+    return None
